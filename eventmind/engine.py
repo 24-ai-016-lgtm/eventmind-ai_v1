@@ -89,7 +89,7 @@ def plan(facts):
     if students is not None and teams is not None and team_size and teams * team_size != students:
         warnings.append('Student count does not match team count × team size.')
 
-    venue_offers = [f for f in confirmed if f.get('key')=='venue.offer' and isinstance(f.get('value'),dict)]
+    venue_offers = [f for f in facts if isinstance(f, dict) and f.get('kind') in ('confirmed', 'proposed') and str(f.get('key', '')).startswith('venue.offer') and isinstance(f.get('value'),dict)]
     by_venue = {}
     for offer in venue_offers:
         name = str(offer['value'].get('name','')).strip()
@@ -101,6 +101,62 @@ def plan(facts):
         capacity, cost = _num(v.get('capacity')), _num(v.get('cost'))
         if capacity is not None and cost is not None and (attendees is None or capacity >= attendees):
             valid_venues.append({'name':v['name'],'capacity':int(capacity),'cost':cost,'generator':bool(v.get('generator',False)),'source':f.get('source','')})
+
+    def named_venue(text, name):
+        text = str(text)
+        direct = re.search(
+            r"(?<!\\w)" + re.escape(str(name)) + r"(?!\\w)",
+            text, re.I
+        )
+        if direct:
+            return True
+
+        m = re.fullmatch(r"(hall|room)\\s*(\\d+)", str(name), re.I)
+        if not m:
+            return False
+
+        prefix, number = m.groups()
+        pattern = (
+            r"\\b" + prefix + r"s?\\s+\\d+"
+            r"(?:\\s*(?:,|and|&)\\s*\\d+)*"
+        )
+        for group in re.findall(pattern, text, re.I):
+            if number in re.findall(r"\\d+", group):
+                return True
+        return False
+
+    for fact in facts:
+        source_text = str(fact.get("source", ""))
+        low = source_text.lower()
+
+        if "ramp" in low and "only" in low:
+            for item in valid_venues:
+                item["ramp_access"] = named_venue(
+                    source_text, item["name"]
+                )
+                if "ground floor" in low:
+                    item["floor_access"] = item["ramp_access"]
+
+    for fact in facts:
+        source_text = str(fact.get("source", ""))
+        key = str(fact.get("key", "")).lower()
+        low = source_text.lower()
+
+        explicitly_unavailable = bool(re.search(
+            r"under maintenance|cannot be booked|"
+            r"unavailable|not available|fully booked|"
+            r"closed for repairs",
+            low, re.I
+        ))
+
+        if explicitly_unavailable and (
+            "venue" in key or "hall" in low or "room" in low
+        ):
+            valid_venues = [
+                v for v in valid_venues
+                if not named_venue(source_text, v["name"])
+            ]
+
     # Generic constraint schema: constraint.<scope>.<field>, value may be
     # a scalar or {operator: required|eq|gte|lte, value: ...}.
     # Backward compatibility: a name-less 'venue.offer' whose source explicitly
@@ -110,6 +166,21 @@ def plan(facts):
     for f in confirmed:
         key = str(f.get('key',''))
         if key.startswith('constraint.'):
+            low = str(f.get("source", "")).lower()
+            lower_key = key.lower()
+
+            if "library" in lower_key or "library" in low:
+                continue
+
+            if (
+                "unavailable" in lower_key
+                or "availability" in lower_key
+            ) and (
+                "maintenance" in low
+                or "cannot be booked" in low
+                or "unavailable" in low
+            ):
+                continue
             value = f.get('value')
             parts = key.split('.')
             scope = parts[1] if len(parts)>1 else None
@@ -164,6 +235,115 @@ def plan(facts):
     if unsupported_constraints:
         warnings.append('One or more mandatory constraints could not be verified: '+
                         ', '.join(str(c['key']) for c in unsupported_constraints))
+
+
+
+    # Build candidates directly from quoted venue offers.
+    candidates = []
+    for offer in by_venue.values():
+        v = offer["value"]
+        capacity = _num(v.get("capacity"))
+        cost = _num(v.get("cost"))
+        if (
+            v.get("name")
+            and capacity is not None
+            and cost is not None
+            and (attendees is None or capacity >= attendees)
+        ):
+            candidates.append({
+                **v,
+                "capacity": int(capacity),
+                "cost": cost,
+                "source": offer.get("source", "")
+            })
+
+    # Read explicitly named groups: e.g. "Halls 2 and 3".
+    accessible_names = set()
+    closed_names = set()
+    access_evidence_found = False
+
+    for fact in facts:
+        key = str(fact.get("key", "")).lower()
+        source_text = str(fact.get("source", ""))
+        low = source_text.lower()
+
+        if "ramp" in low and "only" in low:
+            access_evidence_found = True
+            groups = re.findall(
+                r"\bhalls?\s+(\d+(?:\s*(?:and|,|&)\s*\d+)*)",
+                source_text,
+                flags=re.I
+            )
+            for group in groups:
+                for number in re.findall(r"\d+", group):
+                    accessible_names.add("hall" + number)
+
+        if (
+            "maintenance" in low
+            or "cannot be booked" in low
+            or "unavailable" in low
+            or (
+                "availability" in key
+                and isinstance(fact.get("value"), dict)
+                and fact["value"].get("value") is False
+            )
+        ):
+            for candidate in candidates:
+                name = candidate["name"]
+                if re.search(
+                    r"(?<!\w)" + re.escape(name) + r"(?!\w)",
+                    source_text, flags=re.I
+                ):
+                    closed_names.add(
+                        re.sub(r"\W+", "", name.lower())
+                    )
+
+    accessibility_required = any(
+        str(f.get("key", "")).startswith("constraint.venue.")
+        and any(
+            term in str(f.get("key", "")).lower()
+            for term in ("ramp", "step_free", "floor_access")
+        )
+        for f in facts
+    )
+
+    eligible = []
+    for candidate in candidates:
+        normalized = re.sub(
+            r"\W+", "", candidate["name"].lower()
+        )
+        candidate["ramp_access"] = (
+            normalized in accessible_names
+            if access_evidence_found else None
+        )
+
+        if normalized in closed_names:
+            continue
+
+        if accessibility_required and (
+            not access_evidence_found
+            or normalized not in accessible_names
+        ):
+            continue
+
+        eligible.append(candidate)
+
+    valid_venues = eligible
+
+    if accessibility_required and not access_evidence_found:
+        warnings.append(
+            "Accessible venue evidence is missing."
+        )
+
+    if any(
+        "step_free" in str(f.get("key", "")).lower()
+        for f in facts
+    ):
+        warnings.append(
+            "Full step-free access throughout the venue "
+            "still requires verification."
+        )
+
     valid_venues.sort(key=lambda v: (v['cost'],v['capacity']))
     venue = valid_venues[0] if valid_venues else None
     if not venue:
@@ -172,7 +352,7 @@ def plan(facts):
     food_offers = [
         f for f in facts
         if f.get('kind') in ('confirmed', 'proposed')
-        and f.get('key') == 'food.offer'
+        and str(f.get('key', '')).startswith('food.offer')
         and isinstance(f.get('value'), dict)
     ]
 
@@ -238,7 +418,14 @@ def plan(facts):
     menus.sort(key=lambda m: m['unit_cost'])
 
     # Requests to reduce meal orders are checked against derived attendance, regardless of sender.
-    quantity_requests = [f for f in facts if f.get('key')=='food.order_quantity']
+    quantity_requests = [
+        f for f in facts
+        if f.get('key') == 'food.order_quantity'
+        and any(
+            word in str(f.get('source', '')).lower()
+            for word in ('meal', 'box', 'lunch', 'food', 'order', 'plate')
+        )
+    ]
     for f in quantity_requests:
         n = _num(f.get('value'))
         if attendees is not None and n is not None and n < attendees:
@@ -258,11 +445,37 @@ def plan(facts):
         evidence[k]={'source':f.get('source',''),'sender':f.get('sender',''),'date':f.get('date','')}
     judge_cost=judges*honorarium if judges is not None else 0
     fixed_total=sum(committed.values()) + judge_cost + (venue['cost'] if venue else 0)
+    service_rate = 0.0
+
+    for fact in sorted(facts, key=_rank):
+        key = str(fact.get("key", "")).lower()
+        evidence = str(fact.get("source", ""))
+        if (
+            "service_charge" not in key
+            and "service charge" not in evidence.lower()
+        ):
+            continue
+
+        value = fact.get("value")
+        numeric = _num(value)
+        match = re.search(
+            r"(\\d+(?:\\.\\d+)?)\\s*%", evidence
+        )
+
+        if numeric is not None:
+            service_rate = numeric
+            if service_rate > 1:
+                service_rate /= 100
+        elif match:
+            service_rate = float(match.group(1)) / 100
+
     food_options=[]
     for m in menus:
         if attendees is not None:
-            total=attendees*m['unit_cost'] + m['delivery_cost']
-            food_options.append(dict(m,total_cost=total,feasible=budget is not None and fixed_total+total<=budget))
+            subtotal = attendees*m['unit_cost'] + m['delivery_cost']
+            service_charge = subtotal * service_rate
+            total = subtotal + service_charge
+            food_options.append(dict(m,service_charge_rate=service_rate,service_charge=service_charge,total_cost=total,feasible=budget is not None and fixed_total+total<=budget))
     # Prefer budget-feasible standard meal when available; otherwise lowest-cost feasible meal.
     feasible=[o for o in food_options if o['feasible']]
     standards=[o for o in feasible if 'standard' in o['name'].lower()]
