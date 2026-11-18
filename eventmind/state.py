@@ -14,6 +14,60 @@ def process(raw_text: str, previous: dict | None = None):
     # The language model may put requirements in a top-level "constraints"
     # object instead of "facts". Preserve them in the same audited fact stream.
     normalized = list(parsed.get('facts') or [])
+
+    # Detect explicit unavailability for already named venue offers.
+    import re
+    known_offers = [
+        f for f in list(previous.get("facts", [])) + normalized
+        if str(f.get("key", "")).startswith("venue.offer")
+        and isinstance(f.get("value"), dict)
+        and f["value"].get("name")
+    ]
+    blocks = re.split(r"(?=^#\\d+\\s*\\|)", raw_text, flags=re.M)
+    for block in blocks:
+        if not re.search(
+            r"under maintenance|cannot be booked|unavailable|"
+            r"not available|fully booked|closed for repairs",
+            block, re.I
+        ):
+            continue
+        for offer in known_offers:
+            name = str(offer["value"]["name"])
+            if re.search(
+                r"(?<!\\w)" + re.escape(name) + r"(?!\\w)",
+                block, re.I
+            ):
+                key = "venue.unavailable." + re.sub(
+                    r"\\W+", "_", name.lower()
+                )
+                if not any(f.get("key") == key for f in normalized):
+                    normalized.append({
+                        "key": key,
+                        "value": {"name": name},
+                        "source": block.strip(),
+                        "sender": "venue availability notice",
+                        "date": "",
+                        "kind": "confirmed"
+                    })
+    # Extract an explicitly stated catering service percentage.
+    import re
+    for message in re.split(r"(?=^#\\d+\\s*\\|)", raw_text, flags=re.M):
+        if "service charge" not in message.lower():
+            continue
+        match = re.search(r"(\\d+(?:\\.\\d+)?)\\s*%", message)
+        if match and not any(
+            "service_charge" in str(f.get("key", ""))
+            for f in normalized
+        ):
+            normalized.append({
+                "key": "food.order.service_charge_rate",
+                "value": float(match.group(1)) / 100,
+                "source": match.group(0) + " service charge",
+                "sender": "Caterer",
+                "date": "",
+                "kind": "confirmed"
+            })
+
     constraints = parsed.get('constraints') or {}
     if isinstance(constraints, dict):
         constraints = list(constraints.items())
@@ -58,6 +112,20 @@ def process(raw_text: str, previous: dict | None = None):
             item['_sequence']=start+i
             item['_is_update']=bool(previous.get('facts'))
             facts.append(item)
+
+    # Preserve raw venue accessibility evidence for deterministic checking.
+    import re
+    for block in re.split(r"(?=^#\\d+\\s*\\|)", raw_text, flags=re.M):
+        if "ramp access" in block.lower() or "ground floor" in block.lower():
+            facts.append({
+                "key": "venue.access_evidence",
+                "value": block.strip(),
+                "source": block.strip(),
+                "sender": "Original venue message",
+                "date": "",
+                "kind": "informational"
+            })
+
     outcome=plan(facts)
     outcome.update({'facts':facts,'trace':trace,'notes':list(previous.get('notes',[]))+parsed.get('notes',[]),
                     'message_history':list(previous.get('message_history',[]))+[raw_text],
